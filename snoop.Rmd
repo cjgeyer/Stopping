@@ -1,0 +1,224 @@
+---
+title: "Bayesian Data Snooping"
+author: "Charles J. Geyer"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  bookdown::html_document2:
+    number_sections: true
+    md_extensions: -tex_math_single_backslash
+    mathjax: https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.1/MathJax.js?config=TeX-AMS-MML_HTMLorMML
+  bookdown::pdf_document2:
+    number_sections: true
+    md_extensions: -tex_math_single_backslash
+linkcolor: blue
+urlcolor: blue
+---
+
+# License
+
+This work is licensed under a Creative Commons
+Attribution-ShareAlike 4.0 International License
+(http://creativecommons.org/licenses/by-sa/4.0/).
+
+# R
+
+ * The version of R used to make this document is `r getRversion()`.
+
+ * The version of the `rmarkdown` package used to make this document is
+   `r packageVersion("rmarkdown")`.
+
+# Data Snooping
+
+Statisticians have long had a pejorative term "data snooping"
+or "data dredging", which many newer terms such a $P$-hacking
+and HARKing serve as partial replacements.  Outside of statistics,
+the term "cherry picking" is often used to indicate selective
+use of evidence: ignoring evidence against one's pet theory and
+possibly mischaracterising putative evidence for it.
+
+Many Bayesians have long argued that "optional stopping" for Bayesians
+is not a problem.  It does not change the likelihood and hence does not
+change Bayesian inference.  A recent paper arguing this is
+
+> Jeffrey N. Rouder (2014)  
+> Optional stopping: No problem for Bayesians  
+> *Psychonomic Bulletin & Review*, **21**, 301–308  
+> [DOI:10.3758/s13423-014-0595-4](https://doi.org/10.3758/s13423-014-0595-4)
+
+More astute Bayesians have realized that this is a problem.
+
+> Rianne de Heide and Peter D. Grünwald (2020)  
+> Why optional stopping can be a problem for Bayesians  
+> *Psychonomic Bulletin & Review*, online  
+> [DOI:10.3758/s13423-020-01803-x](https://doi.org/10.3758/s13423-020-01803-x)
+
+> Paul R. Rosenbaum and Donald B. Rubin (1984)  
+> Sensitivity of Bayes Inference with Data-Dependent Stopping Rules  
+> *The American Statistician*, **38**, 106–109  
+> [DOI:10.1080/00031305.1984.10483176](https://doi.org/10.1080/00031305.1984.10483176)
+
+Here we look at stopping rules similar to those discussed by
+Rosenbaum and Rubin but even more "data snooping".
+We do Bayesian inference of independent and identically distributed
+normal data with known variance and flat prior so there is no difference
+between frequentist and Bayesian intervals.  Thus there is nothing
+inherently Bayesian about the rest of our discussion.  What "data snooping"
+we allow affects frequentists and Bayesians in exactly the same way.
+
+# Our Stopping Rule
+
+Without loss of generality, assume the known variance of our data is one.
+Our stopping rule is that we do not stop until the sample mean $\bar{x}_n$
+is greater than $C / \sqrt{n}$ where $n$ is the sample size and $C > 0$ is
+a data-snooper-specified constant.  Note that the frequentist or Bayesian
+interval estimate of the true unknown mean (with, as mentioned above,
+flat prior on this unknown mean) is $\bar{x}_n \pm z_{\alpha / 2} / \sqrt{n}$,
+where $z_{\alpha / 2}$ is the $1 - \alpha / 2$ quantile of the standard
+normal distribution, where $1 - \alpha$ is the desired frequentist coverage
+probability or Bayesian posterior probability.  Hence large enough $C$
+guarantees that the resulting interval will exclude zero, even when zero
+is the true unknown mean.
+
+The law of the iterated logarithm says
+$$
+   \limsup_{n \to \infty} \frac{\bar{x}_n}{\sqrt{2 \log(\log(n)) / n}} = 1
+$$
+So with probability one $\bar{x}_n$ will eventually exceed $C / \sqrt{n}$
+for any $C$.
+
+But we may have to wait a very long time for that to happen.  So we
+allow for minimum and maximum values of the sample size.  And we see what
+happens.  For efficiency, we code our stopping rule in C.
+```{c foo, results="hide"}
+#include <R.h>
+#include <Rmath.h>
+#include <Rinternals.h>
+#include <R_ext/Utils.h>
+#include <math.h>
+
+SEXP foo(SEXP crit_in, SEXP nmin_in, SEXP nmax_in) {
+
+    if (! isReal(crit_in))
+        error("argument crit must be storage mode double");
+    if (! isReal(nmin_in))
+        error("argument nmin must be storage mode double");
+    if (! isReal(nmax_in))
+        error("argument nmax must be storage mode double");
+    if (LENGTH(crit_in) != 1)
+        error("argument crit must be length one");
+    if (LENGTH(nmin_in) != 1)
+        error("argument nmin must be length one");
+    if (LENGTH(nmax_in) != 1)
+        error("argument nmax must be length one");
+    const double crit = REAL(crit_in)[0];
+    const long nmin = REAL(nmin_in)[0];
+    const long nmax = REAL(nmax_in)[0];
+    if (crit <= 0)
+        error("argument crit must be positive");
+    if (nmin <= 0)
+        error("argument nmin must be positive");
+    if (nmax <= 0)
+        error("argument nmax must be positive");
+ 
+    const double critsq = crit * crit;
+
+    GetRNGstate();
+
+    double sum_x = 0.0;
+    double n = 0.0;
+
+    for (;;) {
+        R_CheckUserInterrupt();
+        sum_x += norm_rand();
+        n += 1;
+        if (n >= nmin && sum_x > 0 && sum_x * sum_x > critsq * n) break;
+        if (n >= nmax) break;
+    }
+
+    PutRNGstate();
+
+    SEXP result = PROTECT(allocVector(REALSXP, 2));
+    REAL(result)[0] = sum_x;
+    REAL(result)[1] = n;
+    UNPROTECT(1);
+    return result;
+}
+```
+
+And exercise our code as follows.
+```{r snoop.setup,cache=TRUE,cache.vars=c(".Random.seed", "nboot", "crit", "nmax", "nmin")}
+set.seed(42)
+
+nboot <- 30
+crit <- qnorm(0.95)
+crit
+nmax <- 1e9
+nmin <- 1e2
+```
+```{r snoop,cache=TRUE,dependson="snoop.setup"}
+foo_star <- NULL
+
+for (iboot in 1:nboot)
+    foo_star <- rbind(foo_star,
+        .Call("foo", as.double(crit), as.double(nmin), as.double(nmax)))
+
+foo_star[ , 1] <- foo_star[ , 1] / sqrt(foo_star[ , 2])
+colnames(foo_star) <- c("z", "n")
+foo_star <- as.data.frame(foo_star)
+print(foo_star, row.names = FALSE)
+```
+Having a smaller `nmin` would allow not only for shorter runs but also
+would allow for a smaller proportion of runs hitting `nmax` because
+there can be less negativity for our stopping rule to overcome.
+
+In the runs above we had $n$ less than `nmax` with probability
+`r p <- mean(foo_star$n != nmax); p`
+(estimated, standard error `r round(sqrt(p * (1 - p) / nrow(foo_star)), 3)`)
+
+If we decrease `nmin` to the minimum allowable,
+then we get a higher probability.
+```{r snoop.too,cache=TRUE,dependson="snoop"}
+nmin <- 1
+
+foo_star <- NULL
+
+for (iboot in 1:nboot)
+    foo_star <- rbind(foo_star,
+        .Call("foo", as.double(crit), as.double(nmin), as.double(nmax)))
+
+foo_star[ , 1] <- foo_star[ , 1] / sqrt(foo_star[ , 2])
+colnames(foo_star) <- c("z", "n")
+foo_star <- as.data.frame(foo_star)
+print(foo_star, row.names = FALSE)
+```
+Now we have $n$ less than `nmax` with probability
+`r p <- mean(foo_star$n != nmax); p`
+(estimated, standard error `r round(sqrt(p * (1 - p) / nrow(foo_star)), 3)`)
+
+With the critical value we chose the 90% interval is guaranteed to not
+contain the true unknown parameter value (zero in our simulations) with
+probability one conditional on $n$ less than `nmax`.
+
+Our analysis using the law of the iterated logarithm shows we can increase
+this probability to 100% by setting `nmax <- Inf` but that may result
+in huge amounts of computing time being used.
+
+We will just show what happens by bumping `nmax` by a factor of 100.
+```{r snoop.too.too,cache=TRUE,dependson="snoop.too"}
+nmax <- nmax * 100
+
+foo_star <- NULL
+
+for (iboot in 1:nboot)
+    foo_star <- rbind(foo_star,
+        .Call("foo", as.double(crit), as.double(nmin), as.double(nmax)))
+
+foo_star[ , 1] <- foo_star[ , 1] / sqrt(foo_star[ , 2])
+colnames(foo_star) <- c("z", "n")
+foo_star <- as.data.frame(foo_star)
+print(foo_star, row.names = FALSE)
+```
+Now we have $n$ less than `nmax` with probability
+`r p <- mean(foo_star$n != nmax); p`
+(estimated, standard error `r round(sqrt(p * (1 - p) / nrow(foo_star)), 3)`)
+
